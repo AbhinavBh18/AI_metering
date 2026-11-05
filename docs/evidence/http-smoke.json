@@ -1,0 +1,19 @@
+{
+  "health": {
+    "status": "ok",
+    "storage": "sqlite",
+    "payments": "test_mode_only"
+  },
+  "docs_status": 200,
+  "openapi_status": 200,
+  "unauthenticated_usage_status": 401,
+  "demo": {
+    "first_status": 200,
+    "retry_status": 200,
+    "identical_response": true,
+    "new_usage_events": 1,
+    "total_tokens": 1500,
+    "cost_micro_usd": 24000,
+    "cost_usd": "0.024000"
+  }
+}
