@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from uuid import uuid4
-from app.db import tenant_plan, rollup
+from app.postgres import tenant_plan, rollup, lock_tenant
 from app.errors import DomainError
 from app.pricing import price_usage, usd_string
 from config import PRICING_VERSION
@@ -25,7 +25,8 @@ class MeterService:
     def record(self, tenant_id, usage, key):
         fingerprint = hashlib.sha256(json.dumps(usage.model_dump(), sort_keys=True).encode()).hexdigest()
         with self.db.transaction() as conn:
-            old = conn.execute("SELECT request_hash, response_json FROM usage_events WHERE tenant_id=? AND idempotency_key=?", (tenant_id, key)).fetchone()
+            lock_tenant(conn, tenant_id)
+            old = conn.execute("SELECT request_hash, response_json FROM usage_events WHERE tenant_id=%s AND idempotency_key=%s", (tenant_id, key)).fetchone()
             if old:
                 if old["request_hash"] != fingerprint:
                     raise DomainError(409, "idempotency_conflict", "This key was already used with different token counts.")
@@ -53,7 +54,7 @@ class MeterService:
                         "result": "Simulated AI response; no model was called.",
                         "usage": {"api_calls": 1, **usage.model_dump(), "total_tokens": quantities["ai_tokens"]},
                         "cost": cost, "created_at": now.isoformat()}
-            conn.execute("INSERT INTO usage_events VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            conn.execute("INSERT INTO usage_events VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
                 (event_id, tenant_id, key, fingerprint, period, 1, usage.input_tokens, usage.cached_input_tokens,
                  usage.output_tokens, usage.reasoning_tokens, quantities["ai_tokens"], cost["total_micro_usd"],
                  PRICING_VERSION, json.dumps(response), now.isoformat()))

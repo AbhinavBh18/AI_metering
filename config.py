@@ -18,7 +18,8 @@ class PRICING:
 
 @dataclass(frozen=True)
 class Settings:
-    database_path: str = str(ROOT / "data" / "metering.db")
+    database_url: str = "postgresql://metering:metering_local@127.0.0.1:5432/metering"
+    database_schema: str = "public"
     stripe_secret_key: str = ""
     stripe_webhook_secret: str = ""
     stripe_pro_price_id: str = ""
@@ -26,6 +27,8 @@ class Settings:
     port: int = 8000
 
     def __post_init__(self):
+        if not self.database_url.startswith(("postgresql://", "postgres://")):
+            raise ValueError("DATABASE_URL must use PostgreSQL")
         if self.stripe_secret_key and not self.stripe_secret_key.startswith("sk_test_"):
             raise ValueError("Only Stripe sk_test_ keys are allowed")
         if not self.public_base_url.startswith(("http://localhost:", "http://127.0.0.1:", "https://")):
@@ -35,7 +38,7 @@ class Settings:
     def from_env(cls):
         load_dotenv(ROOT / ".env")
         return cls(
-            database_path=os.getenv("DATABASE_PATH", str(ROOT / "data" / "metering.db")),
+            database_url=os.getenv("DATABASE_URL", cls.database_url),
             stripe_secret_key=os.getenv("STRIPE_SECRET_KEY", ""),
             stripe_webhook_secret=os.getenv("STRIPE_WEBHOOK_SECRET", ""),
             stripe_pro_price_id=os.getenv("STRIPE_PRO_PRICE_ID", ""),

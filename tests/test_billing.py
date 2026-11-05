@@ -32,8 +32,8 @@ def test_duplicate_event_is_processed_once(system):
     assert not app.state.worker.run_once()
     assert deliver(client).json()["status"] == "processed"
     with app.state.db.read() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM jobs").fetchone()[0] == 1
-        assert conn.execute("SELECT attempts FROM jobs").fetchone()[0] == 1
+        assert conn.execute("SELECT COUNT(*) AS count FROM jobs").fetchone()["count"] == 1
+        assert conn.execute("SELECT attempts FROM jobs").fetchone()["attempts"] == 1
 
 
 def test_forged_webhook_400_no_side_effects(system):
@@ -41,8 +41,8 @@ def test_forged_webhook_400_no_side_effects(system):
     raw, headers = signed(event(), secret="wrong")
     assert client.post("/webhooks/stripe", content=raw, headers=headers).status_code == 400
     with app.state.db.read() as conn:
-        assert conn.execute("SELECT COUNT(*) FROM webhook_events").fetchone()[0] == 0
-        assert conn.execute("SELECT plan_id FROM subscriptions WHERE tenant_id='alpha'").fetchone()[0] == "free"
+        assert conn.execute("SELECT COUNT(*) AS count FROM webhook_events").fetchone()["count"] == 0
+        assert conn.execute("SELECT plan_id FROM subscriptions WHERE tenant_id='alpha'").fetchone()["plan_id"] == "free"
 
 
 @pytest.mark.parametrize("kind", ["stale", "future", "live", "malformed"])
@@ -141,11 +141,11 @@ def test_expired_lease_recovered_and_tenant_jobs_serialized(system):
     job = app.state.worker.claim()
     assert job and app.state.worker.claim() is None
     with app.state.db.transaction() as conn:
-        conn.execute("UPDATE jobs SET lease_until=0 WHERE id=?", (job["id"],))
+        conn.execute("UPDATE jobs SET lease_until=0 WHERE id=%s", (job["id"],))
     recovered = app.state.worker.claim()
     assert recovered and recovered["id"] != job["id"]
     with app.state.db.read() as conn:
-        assert conn.execute("SELECT last_error FROM jobs WHERE id=?", (job["id"],)).fetchone()[0] == "lease_expired"
+        assert conn.execute("SELECT last_error FROM jobs WHERE id=%s", (job["id"],)).fetchone()["last_error"] == "lease_expired"
 
 
 def test_expired_worker_cannot_commit_stale_snapshot(system):

@@ -1,16 +1,37 @@
 services:
+  db:
+    image: postgres:18
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-metering}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-metering_local}
+      POSTGRES_DB: ${POSTGRES_DB:-metering}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql
+      - ./docker/init-test-db.sql:/docker-entrypoint-initdb.d/10-test-db.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
   api:
     build: .
     ports:
       - "127.0.0.1:8000:8000"
     environment:
-      DATABASE_PATH: /app/data/metering.db
+      DATABASE_URL: postgresql://${POSTGRES_USER:-metering}:${POSTGRES_PASSWORD:-metering_local}@db:5432/${POSTGRES_DB:-metering}
       PUBLIC_BASE_URL: http://localhost:8000
       STRIPE_SECRET_KEY: ${STRIPE_SECRET_KEY:-}
       STRIPE_WEBHOOK_SECRET: ${STRIPE_WEBHOOK_SECRET:-}
       STRIPE_PRO_PRICE_ID: ${STRIPE_PRO_PRICE_ID:-}
     volumes:
       - metering-data:/app/data
+    depends_on:
+      db:
+        condition: service_healthy
     restart: unless-stopped
 volumes:
   metering-data:
+  postgres-data:

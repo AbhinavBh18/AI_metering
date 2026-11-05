@@ -4,6 +4,7 @@ import threading
 import time
 from uuid import uuid4
 from app.metering import utc_now
+from app.postgres import lock_tenant
 
 logger = logging.getLogger(__name__)
 MAX_ATTEMPTS = 5
@@ -16,11 +17,11 @@ class Worker:
 
     def fail(self, conn, job, code):
         terminal = job["attempts"] >= MAX_ATTEMPTS
-        conn.execute("UPDATE jobs SET status=?,available_at=?,lease_until=NULL,lease_token=NULL,last_error=? WHERE id=?",
+        conn.execute("UPDATE jobs SET status=%s,available_at=%s,lease_until=NULL,lease_token=NULL,last_error=%s WHERE id=%s",
                      ("failed" if terminal else "queued", int(self.clock()) + min(300, 2 ** job["attempts"]), code, job["id"]))
         if terminal:
-            conn.execute("UPDATE webhook_events SET status='failed' WHERE event_id=?", (job["event_id"],))
-            conn.execute("INSERT OR IGNORE INTO alerts VALUES (?,?,?,?,?,?)",
+            conn.execute("UPDATE webhook_events SET status='failed' WHERE event_id=%s", (job["event_id"],))
+            conn.execute("INSERT INTO alerts VALUES (%s,%s,%s,%s,%s,%s) ON CONFLICT (job_id) DO NOTHING",
                          (str(uuid4()), job["tenant_id"], job["id"], "billing_sync_failed",
                           "Stripe synchronization exhausted retries. Inspect configuration, then requeue this job.", utc_now().isoformat()))
             logger.error("billing_sync_failed job_id=%s tenant_id=%s", job["id"], job["tenant_id"])
@@ -28,18 +29,20 @@ class Worker:
     def claim(self):
         now = int(self.clock())
         with self.db.transaction() as conn:
-            expired = conn.execute("SELECT * FROM jobs WHERE status='running' AND lease_until<=?", (now,)).fetchall()
+            # Serialize short queue claims, never network work or metering.
+            conn.execute("SELECT pg_advisory_xact_lock(30, hashtext(current_schema()))")
+            expired = conn.execute("SELECT * FROM jobs WHERE status='running' AND lease_until<=%s FOR UPDATE", (now,)).fetchall()
             for job in expired:
                 self.fail(conn, job, "lease_expired")
-            job = conn.execute("""SELECT j.* FROM jobs j WHERE j.status='queued' AND j.available_at<=?
+            job = conn.execute("""SELECT j.* FROM jobs j WHERE j.status='queued' AND j.available_at<=%s
                 AND NOT EXISTS (SELECT 1 FROM jobs active WHERE active.tenant_id=j.tenant_id AND active.status='running')
-                ORDER BY j.available_at,j.id LIMIT 1""", (now,)).fetchone()
+                ORDER BY j.available_at,j.id LIMIT 1 FOR UPDATE OF j SKIP LOCKED""", (now,)).fetchone()
             if not job:
                 return None
             token = str(uuid4())
-            conn.execute("UPDATE jobs SET status='running',attempts=attempts+1,lease_until=?,lease_token=? WHERE id=?",
+            conn.execute("UPDATE jobs SET status='running',attempts=attempts+1,lease_until=%s,lease_token=%s WHERE id=%s",
                          (now + LEASE_SECONDS, token, job["id"]))
-            return dict(conn.execute("SELECT * FROM jobs WHERE id=?", (job["id"],)).fetchone())
+            return dict(conn.execute("SELECT * FROM jobs WHERE id=%s", (job["id"],)).fetchone())
 
     def snapshot(self, customer_id):
         matches = []
@@ -62,20 +65,21 @@ class Worker:
             return False
         try:
             with self.db.read() as conn:
-                customer = conn.execute("SELECT stripe_customer_id FROM tenants WHERE id=?", (job["tenant_id"],)).fetchone()[0]
+                customer = conn.execute("SELECT stripe_customer_id FROM tenants WHERE id=%s", (job["tenant_id"],)).fetchone()["stripe_customer_id"]
             plan, status, subscription_id = self.snapshot(customer)
             with self.db.transaction() as conn:
-                owned = conn.execute("SELECT 1 FROM jobs WHERE id=? AND status='running' AND lease_token=? AND lease_until>?",
+                lock_tenant(conn, job["tenant_id"])
+                owned = conn.execute("SELECT 1 FROM jobs WHERE id=%s AND status='running' AND lease_token=%s AND lease_until>%s FOR UPDATE",
                                      (job["id"], job["lease_token"], int(self.clock()))).fetchone()
                 if owned:
-                    conn.execute("UPDATE subscriptions SET plan_id=?,status=?,stripe_subscription_id=?,synced_at=? WHERE tenant_id=?",
+                    conn.execute("UPDATE subscriptions SET plan_id=%s,status=%s,stripe_subscription_id=%s,synced_at=%s WHERE tenant_id=%s",
                                  (plan, status, subscription_id, utc_now().isoformat(), job["tenant_id"]))
-                    conn.execute("UPDATE jobs SET status='done',lease_until=NULL,lease_token=NULL,last_error=NULL WHERE id=?", (job["id"],))
-                    conn.execute("UPDATE webhook_events SET status='processed' WHERE event_id=?", (job["event_id"],))
+                    conn.execute("UPDATE jobs SET status='done',lease_until=NULL,lease_token=NULL,last_error=NULL WHERE id=%s", (job["id"],))
+                    conn.execute("UPDATE webhook_events SET status='processed' WHERE event_id=%s", (job["event_id"],))
         except Exception as exc:
             # Store only the exception class; upstream messages can contain sensitive data.
             with self.db.transaction() as conn:
-                owned = conn.execute("SELECT 1 FROM jobs WHERE id=? AND status='running' AND lease_token=?", (job["id"], job["lease_token"])).fetchone()
+                owned = conn.execute("SELECT 1 FROM jobs WHERE id=%s AND status='running' AND lease_token=%s FOR UPDATE", (job["id"], job["lease_token"])).fetchone()
                 if owned:
                     self.fail(conn, job, type(exc).__name__)
         return True

@@ -1,6 +1,6 @@
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
-import sqlite3
+import psycopg
 import pytest
 from app.errors import DomainError
 from app.metering import MeterService
@@ -11,16 +11,16 @@ from tests.conftest import auth
 SAMPLE = {"input_tokens": 1000, "cached_input_tokens": 400, "output_tokens": 500, "reasoning_tokens": 200}
 
 
-def process_record(path):
-    from app.db import Database
-    return MeterService(Database(path)).record("alpha", GenerateRequest(), "multiprocess")[0]["event_id"]
+def process_record(connection):
+    from app.postgres import Database
+    return MeterService(Database(*connection)).record("alpha", GenerateRequest(), "multiprocess")[0]["event_id"]
 
 
 def test_separate_processes_share_idempotency_guarantee(system):
     from concurrent.futures import ProcessPoolExecutor
     app, _, _, _, _ = system
     with ProcessPoolExecutor(max_workers=4) as pool:
-        ids = list(pool.map(process_record, [app.state.db.path] * 8))
+        ids = list(pool.map(process_record, [(app.state.db.dsn, app.state.db.schema)] * 8))
     assert len(set(ids)) == 1
     assert app.state.meter.summary("alpha")["used"]["event_count"] == 1
 
@@ -163,9 +163,9 @@ def test_utc_month_rollover_and_cross_month_idempotency(system):
 
 def test_persistence_survives_service_recreation(system):
     app, _, _, _, _ = system
-    from app.db import Database
+    from app.postgres import Database
     app.state.meter.record("alpha", GenerateRequest(), "persisted")
-    reopened = Database(app.state.db.path)
+    reopened = Database(app.state.db.dsn, app.state.db.schema)
     reopened.migrate()
     assert MeterService(reopened).summary("alpha")["used"]["event_count"] == 1
 
@@ -173,8 +173,8 @@ def test_persistence_survives_service_recreation(system):
 def test_rollback_leaves_no_charge_on_insert_failure(system):
     app, _, _, _, _ = system
     with app.state.db.transaction() as conn:
-        conn.execute("CREATE TRIGGER reject_insert BEFORE INSERT ON usage_events BEGIN SELECT RAISE(ABORT, 'test failure'); END")
-    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("ALTER TABLE usage_events ADD CONSTRAINT reject_test_insert CHECK (api_calls = 0)")
+    with pytest.raises(psycopg.IntegrityError):
         app.state.meter.record("alpha", GenerateRequest(), "failed")
     assert app.state.meter.summary("alpha")["used"]["event_count"] == 0
 

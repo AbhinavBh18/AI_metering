@@ -10,7 +10,8 @@ Client + tenant API key
         v
 FastAPI: validation / authentication / HTTP errors
         |
-        +-- POST /generate --> MeterService --> BEGIN IMMEDIATE
+        +-- POST /generate --> MeterService --> PostgreSQL transaction
+        |                                      | lock tenant row
         |                                      | deduplicate + fingerprint
         |                                      | check quota + budget
         |                                      + insert event + saved response
@@ -21,7 +22,7 @@ FastAPI: validation / authentication / HTTP errors
                                              |
 Stripe CLI --> signed webhook --> verify --> event + durable job (one transaction)
                                                          |
-                       SQLite <-- entitlement update <-- background worker
+                   PostgreSQL <-- entitlement update <-- background worker
                                                          | current Stripe state
                                                          | lease + retries
                                                          + failure alert
@@ -40,7 +41,7 @@ This is a local capstone implementation. See [EVIDENCE.md](EVIDENCE.md) for veri
 
 ## Run locally
 
-Requires **Python 3.14**. Run commands from this repository. No Docker or Stripe account is needed for metering, quotas, pricing, or the automated suite.
+Requires **Python 3.14 and PostgreSQL 18**. Run commands from this repository. A Stripe account is not needed for metering, quotas, pricing, or the automated suite. PostgreSQL is the sole application database; SQLite is used only by the optional legacy importer.
 
 Windows PowerShell:
 
@@ -48,6 +49,7 @@ Windows PowerShell:
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements-dev.txt -c constraints.txt
 Copy-Item .env.example .env
+docker compose up -d db
 .\.venv\Scripts\python.exe -m app seed
 .\.venv\Scripts\python.exe -m app run
 ```
@@ -59,11 +61,14 @@ python3.14 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements-dev.txt -c constraints.txt
 cp .env.example .env
+docker compose up -d db
 python -m app seed
 python -m app run
 ```
 
-After activating a virtual environment, the single run command is **`python -m app run`**. It applies migrations and starts both the API and billing worker. The seed step is **`python -m app seed`**; it creates two isolated Free tenants and writes their random credentials to git-ignored `data/demo-credentials.json`. Running it again does not reset usage or keys.
+The `db` service creates the development database and a separate test database. `.env.example` matches its local-only credentials. If using an existing PostgreSQL server, create `metering` and `metering_test`, set `DATABASE_URL` and `TEST_DATABASE_URL` in `.env`, and omit the Docker command. The test role needs permission to create schemas in the test database. See [PostgreSQL setup and migration](docs/POSTGRESQL.md) for an alternative using installed PostgreSQL binaries without Docker.
+
+After activating a virtual environment, the single run command is **`python -m app run`**. It applies migrations and starts both the API and billing worker. The seed step is **`python -m app seed`**; it creates two isolated Free tenants and writes their random credentials to git-ignored `data/demo-credentials.json`. Running it again does not reset usage or keys. If upgrading the existing SQLite version, import its data **before** seeding, using the migration guide.
 
 - API explorer: [http://localhost:8000/docs](http://localhost:8000/docs)
 - Health: [http://localhost:8000/health](http://localhost:8000/health)
@@ -144,7 +149,7 @@ Usage estimates are **not** collected by Stripe. Stripe bills only the fixed Pro
 
 Follow [the Stripe setup guide](docs/STRIPE_SETUP.md) to complete the real test checkout. Blank Stripe settings leave the rest of the service usable; checkout returns a clear 503. Only `sk_test_` keys and `livemode: false` events are accepted. A checkout redirect cannot upgrade a tenant.
 
-The background worker runs with the API command. A separate process is also available via `python -m app worker`; `--once` performs one attempt. Jobs are claimed with a 120-second lease and serialized per tenant. Expired leases can be reclaimed; a fencing token prevents an old worker from writing stale results. Five failed attempts lead to a durable alert and a sanitized error log. Retry intervals are 2, 4, 8, and 16 seconds before the fifth attempt. Inspect `/billing/jobs` and `/billing/alerts`, then use the local operator command `python -m app requeue JOB_ID` after fixing the cause.
+The background worker runs with the API command. A separate process is also available via `python -m app worker`; `--once` performs one attempt. Jobs are claimed with a 120-second lease and serialized per tenant. Short claim transactions use a PostgreSQL advisory lock, row locks, and `SKIP LOCKED`; a partial unique index permits only one running job per tenant. Network calls run outside transactions. Expired leases can be reclaimed; a fencing token prevents an old worker from writing stale results. Five failed attempts lead to a durable alert and a sanitized error log. Retry intervals are 2, 4, 8, and 16 seconds before the fifth attempt. Inspect `/billing/jobs` and `/billing/alerts`, then use the local operator command `python -m app requeue JOB_ID` after fixing the cause.
 
 The worker lists current subscriptions for the mapped customer and configured Pro price, with pagination. Active/trialing subscriptions grant Pro; otherwise delinquent states block new usage, and terminal states fall back to Free. This handles delayed/reordered event payloads. A later Stripe change still requires another webhook; there is no periodic reconciliation job.
 
@@ -155,7 +160,7 @@ The worker lists current subscriptions for the mapped customer and configured Pr
 .\.venv\Scripts\python.exe scripts/verify.py
 ```
 
-The second command also saves the real verbose result to `docs/evidence/test-results.txt`. Tests include 32 concurrent retries, competing requests at a quota boundary, multiple processes sharing one database, all 1,000 Free calls, UTC year rollover, malformed input, forged/replayed webhooks, Stripe REST contract fixtures, worker crashes/leases/retries, cancellation, and checkout recovery. Tests never contact Stripe and use isolated temporary databases. GitHub Actions runs the suite after the repository is published.
+The second command also saves the real verbose result to `docs/evidence/test-results.txt`. Tests include 32 retry attempts through a 16-worker pool, competing requests at a quota boundary, multiple processes sharing one database, all 1,000 Free calls, UTC year rollover, malformed input, forged/replayed webhooks, Stripe REST contract fixtures, worker crashes/leases/retries, cancellation, and checkout recovery. PostgreSQL-specific checks cover independent tenant writes, concurrent webhook ingestion and worker claims, parallel migrations, 64-bit money, and legacy data import. Tests never contact Stripe and use random isolated schemas in `TEST_DATABASE_URL`; cleanup drops only each test's own schema. GitHub Actions supplies a PostgreSQL 18 service after the repository is published.
 
 ## Optional Docker path
 
@@ -165,16 +170,17 @@ docker compose exec api python -m app seed
 docker compose exec api cat /app/data/demo-credentials.json
 ```
 
-The final command displays local demo keys; do not paste them into public evidence. The app runs as a non-root user and persists SQLite in a named volume. The port binds only to localhost. Docker configuration is supplied but was not runtime-verified in the development environment because the Docker engine was stopped.
+The final command displays local demo keys; do not paste them into public evidence. The API runs as a non-root user. PostgreSQL data and local demo credentials have separate named volumes, and both published ports bind only to localhost. The API waits for database health before starting. Docker configuration is supplied but was not runtime-verified in the development environment because the Docker engine was stopped; the PostgreSQL backend is verified natively.
 
 ## Repository map
 
 ```text
 app/                 HTTP, domain services, storage, Stripe gateway, worker, CLI
-migrations/          Versioned SQL schema and indexes
+migrations/postgresql/ Versioned PostgreSQL schema and indexes
 tests/               Deterministic behavioral and boundary tests
 scripts/             Live demo, verification capture, local Stripe event replay
 docs/DESIGN.md       One-page architecture and tradeoffs
+docs/POSTGRESQL.md   Database setup, locking, and legacy data import
 docs/STRIPE_SETUP.md Remaining external integration procedure
 docs/RESUME.md       Honest resume bullets and interview talking points
 EVIDENCE.md          Requirement-to-proof matrix and outstanding gates
@@ -184,7 +190,7 @@ capstone.yaml        Evaluator run, seed, test, and probe commands
 
 ## Limitations and submission status
 
-- Built for a single-host capstone. SQLite serializes writers; no throughput or production-scale claim is made. Moving to Postgres requires tenant-row locking or equivalent serializable logic, not simply changing the connection string.
+- PostgreSQL row locks serialize metering per tenant, allowing unrelated tenants to write independently. No throughput or production-scale claim is made. Connections are short-lived; pooling and load-tested capacity planning remain future work.
 - AI usage is supplied to a simulator. A real inference service must meter trusted provider counts and reserve quota before generation, then settle actual usage.
 - Local bearer keys are sufficient for the demo, but key rotation, organization membership/RBAC, public signup, abuse rate limits, and TLS termination are outside scope.
 - Signed events for unknown customers are ignored. Provision customers through this app. There is no automatic reconciliation for missed events, external alert delivery, or queue retention policy.
@@ -195,3 +201,5 @@ capstone.yaml        Evaluator run, seed, test, and probe commands
 ## References
 
 The implementation follows Stripe's documented [Checkout parameters](https://docs.stripe.com/api/checkout/sessions/create), [webhook verification and delivery semantics](https://docs.stripe.com/webhooks), and [subscription listing API](https://docs.stripe.com/api/subscriptions/list). The project requirements come from the supplied FlyRank capstone brief; no external document was treated as authority to publish code, access accounts, or submit the project on the intern's behalf.
+
+Database transaction choices follow [PostgreSQL locking semantics](https://www.postgresql.org/docs/current/explicit-locking.html) and [Psycopg transaction management](https://www.psycopg.org/psycopg3/docs/basic/transactions.html).

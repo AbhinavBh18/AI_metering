@@ -41,3 +41,19 @@ An AI coding assistant generated most of the implementation, SQL schema, tests, 
 ## Intern review before submission
 
 Read `docs/DESIGN.md`, run the demo and tests, trace one accepted request through all layers, and explain the five interview questions in `docs/RESUME.md`. Add your own dated notes about changes and explanations you verified. Keep this AI disclosure honest.
+
+## 2026-11-05 - PostgreSQL migration requested by the intern
+
+This section supersedes the SQLite implementation details and 53-test count above; those entries describe the original build, not the current backend.
+
+- Replaced the application database with PostgreSQL 18 and Psycopg 3.3.8. Application storage is now exclusively PostgreSQL; SQLite remains only in the read-only legacy importer and its test fixture.
+- Replaced database-wide write serialization with tenant row locks (`FOR NO KEY UPDATE`) in read-committed transactions. Plan synchronization takes the same tenant lock. Read-only usage summaries use repeatable-read snapshots.
+- Added PostgreSQL transactional migrations, advisory locks for concurrent migration/event/queue operations, row-locked job completion, a partial unique index limiting each tenant to one running job, BIGINT money, and TIMESTAMPTZ timestamps.
+- Provisioned a project-local PostgreSQL cluster using the existing installed binaries, on localhost:55432. Random SCRAM credentials are in git-ignored `.env`; no system PostgreSQL service was changed. Added Docker database service, database health dependency, and a PostgreSQL CI service.
+- Converted the existing test suite to isolated PostgreSQL schemas and added six PostgreSQL regression checks. **59 tests passed in 163.75 seconds**, with no warnings. The suite exercises a real PostgreSQL server, including multiple Python processes.
+- Stopped the original SQLite API and imported its **2 tenants, 2 subscriptions, and 1 usage event**, preserving the **24,000 micro-USD** ledger cost and existing API key hashes. The SQLite source remains a backup and was opened read-only. Target row counts and total cost were checked before commit.
+- Restarted the API on PostgreSQL. The live HTTP smoke check returned `storage: postgresql`, served docs/OpenAPI, rejected unauthenticated usage, and confirmed two identical requests create one new event with an exact $0.024000 cost.
+- Updated setup, design, evidence, and quantified resume wording to PostgreSQL and 59 tests. Earlier SQLite evidence was archived with explicit `sqlite-` filenames.
+- Python source compilation and dependency consistency checks passed. `docker compose config --quiet` validates the revised Compose configuration; container runtime execution remains unverified because the Docker engine is stopped.
+
+No real Stripe checkout, public repository publication, or production deployment occurred during this migration. The AI assistant performed this migration; the intern should review the transaction choices in `docs/POSTGRESQL.md` before presenting them.

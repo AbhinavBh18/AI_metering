@@ -11,6 +11,7 @@ def main():
     with httpx.Client(base_url="http://127.0.0.1:8000", timeout=15) as client:
         health = client.get("/health")
         assert health.status_code == 200 and health.json()["status"] == "ok"
+        assert health.json()["storage"] == "postgresql"
         docs = client.get("/docs")
         assert docs.status_code == 200
         schema = client.get("/openapi.json")

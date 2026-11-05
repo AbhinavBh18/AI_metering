@@ -1,7 +1,7 @@
 {
   "health": {
     "status": "ok",
-    "storage": "sqlite",
+    "storage": "postgresql",
     "payments": "test_mode_only"
   },
   "docs_status": 200,

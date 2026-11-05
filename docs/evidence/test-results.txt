@@ -1,10 +1,10 @@
 Verification date: 2026-11-05
-Environment: Windows, Python 3.14.0, project-local virtual environment
-Command: .\.venv\Scripts\python.exe -m pytest -q --basetemp=tmp/final-tests --maxfail=3
+Environment: Windows, Python 3.14.0, PostgreSQL 18, Psycopg 3.3.8
+Command: .\.venv\Scripts\python.exe -m pytest -q --basetemp=tmp/postgres-tests --maxfail=2
 
-.....................................................                    [100%]
-53 passed in 25.00s
+...........................................................              [100%]
+59 passed in 163.75s (0:02:43)
 
-This is the captured final test-run output, with terminal progress chunks joined.
-No Stripe network calls were made by this suite. See tests/conftest.py for the explicit fake.
+Terminal progress chunks joined. Tests use real PostgreSQL schemas.
+Stripe uses explicit fakes; no real Stripe network calls occur in the suite.
 Run python scripts/verify.py for a fresh verbose transcript.

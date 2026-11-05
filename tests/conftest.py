@@ -2,11 +2,16 @@ import hashlib
 import hmac
 import json
 import time
+import os
+from uuid import uuid4
+import psycopg
+from psycopg import sql
+from dotenv import load_dotenv
 import pytest
 from fastapi.testclient import TestClient
 from app.main import create_app
 from app.seed import create_tenant
-from config import Settings
+from config import Settings, ROOT
 
 
 class FakeStripe:
@@ -55,9 +60,29 @@ def signed(event_data, secret="whsec_fixture", timestamp=None):
 
 
 @pytest.fixture
-def system(tmp_path):
+def postgres_db():
+    load_dotenv(ROOT / ".env")
+    dsn = os.getenv("TEST_DATABASE_URL")
+    if not dsn:
+        pytest.fail("Set TEST_DATABASE_URL to a PostgreSQL database where the test user can create schemas.")
+    schema = "test_" + uuid4().hex
+    with psycopg.connect(dsn, autocommit=True) as conn:
+        conn.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(schema)))
+    from app.postgres import Database
+    db = Database(dsn, schema)
+    try:
+        yield db
+    finally:
+        # Only drop the randomly named schema created by this fixture, never public.
+        assert schema.startswith("test_") and len(schema) == 37
+        with psycopg.connect(dsn, autocommit=True) as conn:
+            conn.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(schema)))
+
+
+@pytest.fixture
+def system(postgres_db):
     fake = FakeStripe()
-    settings = Settings(database_path=str(tmp_path / "test.db"), stripe_secret_key="sk_test_fixture",
+    settings = Settings(database_url=postgres_db.dsn, database_schema=postgres_db.schema, stripe_secret_key="sk_test_fixture",
                         stripe_webhook_secret="whsec_fixture", stripe_pro_price_id="price_pro")
     app = create_app(settings, fake)
     with TestClient(app) as client:

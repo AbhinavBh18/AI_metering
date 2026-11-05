@@ -1,29 +1,30 @@
 # Capstone evidence
 
-Verified locally on **2026-11-05**, using Windows and Python 3.14.0. Evidence below distinguishes actual local behavior from work that requires an external account.
+Verified locally on **2026-11-05**, using Windows, Python 3.14.0, PostgreSQL 18, and Psycopg 3.3.8. Evidence below distinguishes actual local behavior from work that requires an external account. The earlier SQLite evidence is archived in `docs/evidence/sqlite-baseline.md`; it is not the current backend.
 
-**Local result: 53 automated tests passed, with no warnings. The running HTTP API also passed the smoke/demo checks.** Real hosted Stripe Checkout, Docker runtime validation, public GitHub publication, and remote CI execution remain outstanding.
+**Local result: 59 automated tests passed, with no warnings. The running HTTP API also passed the smoke/demo checks.** Real hosted Stripe Checkout, Docker runtime validation, public GitHub publication, and remote CI execution remain outstanding.
 
 ## Recorded commands and output
 
 Final automated run:
 
 ```text
-.\.venv\Scripts\python.exe -m pytest -q --basetemp=tmp/final-tests --maxfail=3
-.....................................................                    [100%]
-53 passed in 25.00s
+.\.venv\Scripts\python.exe -m pytest -q --basetemp=tmp/postgres-tests --maxfail=2
+...........................................................                    [100%]
+59 passed in 163.75s (0:02:43)
 ```
 
-Saved in [docs/evidence/test-results.txt](docs/evidence/test-results.txt). Run `python scripts/verify.py` for a fresh verbose transcript that names each test. These are deterministic tests against real temporary SQLite databases; Stripe is replaced by an explicit fake or HTTP transport fixture.
+Saved in [docs/evidence/test-results.txt](docs/evidence/test-results.txt). Run `python scripts/verify.py` for a fresh verbose transcript that names each test. These are deterministic tests against a real PostgreSQL 18 server, using isolated temporary schemas; Stripe is replaced by an explicit fake or HTTP transport fixture.
 
-Native run:
+PostgreSQL data cutover and native run:
 
 ```text
-python -m app migrate
-Migrations applied.
-
-python -m app seed
-Created two isolated Free tenants.
+python scripts/import_sqlite.py data/metering.db
+tenants: 2
+subscriptions: 2
+usage_events: 1
+cost_micro_usd: 24000
+source_modified: false
 
 python -m app run
 INFO app.worker Billing worker started
@@ -31,13 +32,13 @@ INFO: Application startup complete.
 INFO: Uvicorn running on http://127.0.0.1:8000
 ```
 
-The seed's random keys were written to the git-ignored data directory. No credential values are included in evidence.
+The import preserved the existing tenant key hashes and stored usage response. The original random demo keys remain valid in the git-ignored data directory. No credential values are included in evidence. The subsequent HTTP smoke test adds one new event, independently of the imported event.
 
 Live HTTP check (`python scripts/smoke.py`), saved in [docs/evidence/http-smoke.json](docs/evidence/http-smoke.json):
 
 ```json
 {
-  "health": {"status": "ok", "storage": "sqlite", "payments": "test_mode_only"},
+  "health": {"status": "ok", "storage": "postgresql", "payments": "test_mode_only"},
   "docs_status": 200,
   "openapi_status": 200,
   "unauthenticated_usage_status": 401,
@@ -53,11 +54,11 @@ Live HTTP check (`python scripts/smoke.py`), saved in [docs/evidence/http-smoke.
 }
 ```
 
-`python -m compileall -q app config.py scripts` also completed with exit code 0 before the final smoke script was added; that script subsequently executed successfully.
+`python -m compileall -q app config.py scripts` completed with exit code 0 after the migration. The migrated application and live smoke script also executed successfully. The PostgreSQL driver dependency check and Compose configuration check are recorded in the migration build log.
 
 ## Section 6: requirement-to-proof map
 
-Every listed test below was included in the 53-pass run. Test names can be run individually with `python -m pytest tests/FILE.py::TEST_NAME -v`.
+Every listed test below was included in the 59-pass run. Test names can be run individually with `python -m pytest tests/FILE.py::TEST_NAME -v`.
 
 | Requirement | Status | Pasted proof / assertion verified |
 |---|---|---|
@@ -70,28 +71,43 @@ Every listed test below was included in the 53-pass run. Test names can be run i
 | Pinned pricing and exact totals | PASS | `config.py` uses 1,000 / 10 / 5 / 30 micro-USD rates. Sample arithmetic: `1000 + (1000-400)*10 + 400*5 + 500*30 = 24000`. Saved event includes `demo-2026-11-v1`. |
 | Stripe hosted checkout end to end | **PENDING external verification** | REST adapter and orchestration tests pass, including `test_checkout_rest_contract_and_test_price_validation`. **No real Stripe session was completed.** Follow `docs/STRIPE_SETUP.md`; paste real sanitized before/after usage and worker output below. |
 | Signed, deduplicated webhooks update subscription | PASS locally; real delivery pending | `test_forged_webhook_400_no_side_effects`: bad signature gives 400 and zero stored events. `test_duplicate_event_is_processed_once`: duplicate is true, one job, one attempt. `test_signed_checkout_job_upgrades_free_to_pro`: signed fixture queues work; worker changes limits to 10,000 / 1,000,000. |
-| Required data model and tenant isolation | PASS | `001_initial.sql` includes tenants, plans, subscriptions, and usage events. `test_tenant_isolation_and_key_scope`: same key text works independently for two tenants; event IDs and read results are isolated. `test_persistence_survives_service_recreation` preserves the ledger after reopening the database. |
+| Required data model and tenant isolation | PASS | `migrations/postgresql/001_initial.sql` includes tenants, plans, subscriptions, and usage events. `test_tenant_isolation_and_key_scope`: same key text works independently for two tenants; event IDs and read results are isolated. `test_persistence_survives_service_recreation` preserves the ledger after reopening the database. |
 | README, diagram, setup, and required files | PRESENT | `README.md` includes a text architecture diagram and exact native/optional Docker commands. `capstone.yaml`, `EVIDENCE.md`, `BUILDLOG.md`, and `.env.example` exist. Public repository URL is still pending. |
 
 ## Shared requirements and additional checks
 
 | Requirement | Proof |
 |---|---|
-| Layered architecture | HTTP in `app/main.py`; logic in metering/billing/pricing/worker; database operations in `app/db.py`; external network boundary in `app/stripe_gateway.py`. Design rationale in `docs/DESIGN.md`. |
+| Layered architecture | HTTP in `app/main.py`; logic in metering/billing/pricing/worker; database operations in `app/postgres.py`; external network boundary in `app/stripe_gateway.py`. Design rationale in `docs/DESIGN.md`. |
 | Input validation | Nine parametrized `test_invalid_input_is_422_and_never_metered` cases pass; missing auth is 401 and missing idempotency key is 422. Raw input is not echoed in validation errors. |
 | Background job, retries, failure alert | `test_transient_failure_then_recovery` verifies backoff then recovery. `test_retry_exhaustion_alert_and_tenant_isolation` verifies five attempts, failed state, a durable tenant-visible alert, and sanitized `RuntimeError` storage. A sanitized error log is emitted. No email/Slack delivery is claimed. |
-| Persistence, migrations, indexes | Migration is applied transactionally; tenant-period and job polling indexes exist. SQLite database file survives service recreation. No in-memory ledger is used. |
+| Persistence, migrations, indexes | Migration is applied transactionally; tenant-period and job polling indexes exist. PostgreSQL ledger rows survive service recreation. No in-memory ledger is used. |
 | Idempotency | Usage key uniqueness, webhook event ID uniqueness, and external checkout idempotency keys. `test_changed_payload_conflicts_without_charge` proves 409 without another charge. |
 | Secret hygiene | Blank safe Stripe settings in `.env.example`; `.env` and `data/` ignored. `test_live_key_configuration_rejected` and `test_live_response_is_rejected` reject live mode. API keys are random and hashed in the database; local seed credentials remain git-ignored. No Stripe credential was supplied during this build. |
-| AI cost attribution and budget | Each event has tenant, usage counts, integer cost, and pricing version. Budget boundary test passes. Counts are simulated, not inferred from a model call. |
+| AI cost attribution and budget | Each event has tenant, usage counts, BIGINT integer cost, and pricing version. Budget boundary test passes. Counts are simulated, not inferred from a model call. |
 | Stale worker fencing and recovery | `test_expired_worker_cannot_commit_stale_snapshot` leaves the plan unchanged after lease expiry. `test_expired_lease_recovered_and_tenant_jobs_serialized` proves reclaim and per-tenant serialization. |
 | Out-of-order subscription events | `test_old_event_cannot_restore_canceled_subscription` and `test_old_cancellation_does_not_remove_new_active_subscription` pass against current-state fixtures. |
 | Checkout recovery | `test_expired_checkout_uses_new_durable_key` and `test_canceled_subscription_can_resubscribe` pass. |
 
+## PostgreSQL-specific regression checks
+
+All six were included in the 59-pass run:
+
+| Test | Observed assertion |
+|---|---|
+| `test_other_tenant_can_meter_while_first_tenant_is_locked` | Beta commits while Alpha's tenant lock remains held. |
+| `test_parallel_webhook_deliveries_enqueue_exactly_once` | 16 deliveries through 8 workers create one queue entry. |
+| `test_parallel_claims_never_run_two_jobs_for_one_tenant` | 8 competing claims for one tenant yield exactly one running job. |
+| `test_parallel_migrations_are_safe` | 4 concurrent migration calls apply the schema once. |
+| `test_bigint_money_and_integer_rollup` | 3,000,000,000 micro-USD persists and rolls up as a Python integer. |
+| `test_legacy_import_preserves_data_and_refuses_nonempty_target` | Legacy tenant/subscription data is preserved; the source bytes are unchanged; a second import is rejected. |
+
+The separate real-data cutover additionally preserved one existing usage event and its exact 24,000 micro-USD cost. Saved transcript: `docs/evidence/postgresql-import.json`.
+
 ## Acceptance probes
 
 1. **Duplicate billable request:** passed both in the suite and over live localhost HTTP.
-2. **Exact quota boundary:** passed against real SQLite with all 1,000 Free calls and a rejecting 1,001st call.
+2. **Exact quota boundary:** passed against real PostgreSQL with all 1,000 Free calls and a rejecting 1,001st call.
 3. **Real Stripe Checkout changes Free to Pro:** **not yet run**. A signed fixture proves internal behavior only.
 4. **Forged webhook and duplicate real event:** forged-event and deduplication mechanics passed locally. A real Stripe-delivered event replay is still pending.
 5. **Pinned AI pricing and `/usage`:** passed in the suite and live HTTP demo.

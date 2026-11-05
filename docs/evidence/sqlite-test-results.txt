@@ -1,0 +1,10 @@
+Verification date: 2026-11-05
+Environment: Windows, Python 3.14.0, project-local virtual environment
+Command: .\.venv\Scripts\python.exe -m pytest -q --basetemp=tmp/final-tests --maxfail=3
+
+.....................................................                    [100%]
+53 passed in 25.00s
+
+This is the captured final test-run output, with terminal progress chunks joined.
+No Stripe network calls were made by this suite. See tests/conftest.py for the explicit fake.
+Run python scripts/verify.py for a fresh verbose transcript.

@@ -2,7 +2,7 @@ import argparse
 import json
 import logging
 import uvicorn
-from app.db import Database
+from app.postgres import Database
 from app.main import create_app
 from app.seed import create_tenant, seed_demo
 from app.stripe_gateway import StripeGateway
@@ -26,7 +26,7 @@ def main():
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(name)s %(message)s")
     settings = Settings.from_env()
-    db = Database(settings.database_path)
+    db = Database(settings.database_url, settings.database_schema)
     db.migrate()
     if args.command == "run":
         uvicorn.run(create_app(settings, start_worker=True), host=args.host, port=settings.port)
@@ -44,11 +44,11 @@ def main():
             worker.run_forever()
     elif args.command == "requeue":
         with db.transaction() as conn:
-            job = conn.execute("SELECT event_id FROM jobs WHERE id=? AND status='failed'", (args.job_id,)).fetchone()
+            job = conn.execute("SELECT event_id FROM jobs WHERE id=%s AND status='failed' FOR UPDATE", (args.job_id,)).fetchone()
             if not job:
                 parser.error("No failed job with that ID")
-            conn.execute("UPDATE jobs SET status='queued',attempts=0,available_at=0,last_error=NULL WHERE id=?", (args.job_id,))
-            conn.execute("UPDATE webhook_events SET status='queued' WHERE event_id=?", (job[0],))
+            conn.execute("UPDATE jobs SET status='queued',attempts=0,available_at=0,last_error=NULL WHERE id=%s", (args.job_id,))
+            conn.execute("UPDATE webhook_events SET status='queued' WHERE event_id=%s", (job["event_id"],))
         print("Job requeued. The historical failure alert is retained.")
 
 

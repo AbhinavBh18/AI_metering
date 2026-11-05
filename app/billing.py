@@ -6,6 +6,7 @@ from uuid import uuid4
 
 from app.errors import DomainError
 from app.metering import utc_now
+from app.postgres import lock_tenant
 
 EVENT_TYPES = {"checkout.session.completed", "customer.subscription.created",
                "customer.subscription.updated", "customer.subscription.deleted"}
@@ -42,20 +43,20 @@ class BillingService:
     def checkout(self, tenant_id):
         self.gateway.require_config()
         with self.db.read() as conn:
-            tenant = conn.execute("SELECT * FROM tenants WHERE id=?", (tenant_id,)).fetchone()
+            tenant = conn.execute("SELECT * FROM tenants WHERE id=%s", (tenant_id,)).fetchone()
         customer_id = tenant["stripe_customer_id"]
         if not customer_id:
             customer_id = self.gateway.create_customer(tenant_id)["id"]
             with self.db.transaction() as conn:
-                conn.execute("UPDATE tenants SET stripe_customer_id=COALESCE(stripe_customer_id,?) WHERE id=?", (customer_id, tenant_id))
-                customer_id = conn.execute("SELECT stripe_customer_id FROM tenants WHERE id=?", (tenant_id,)).fetchone()[0]
+                conn.execute("UPDATE tenants SET stripe_customer_id=COALESCE(stripe_customer_id,%s) WHERE id=%s", (customer_id, tenant_id))
+                customer_id = conn.execute("SELECT stripe_customer_id FROM tenants WHERE id=%s", (tenant_id,)).fetchone()["stripe_customer_id"]
         # Do not start a second subscription while webhook delivery is delayed.
         current = self.gateway.subscriptions(customer_id)
         if any(s.get("status") not in {"canceled", "incomplete_expired"} for s in current):
             raise DomainError(409, "subscription_exists", "This Stripe customer already has a subscription. Manage it in the test dashboard.")
         now = int(time.time())
         with self.db.read() as conn:
-            existing = conn.execute("SELECT * FROM checkout_sessions WHERE tenant_id=?", (tenant_id,)).fetchone()
+            existing = conn.execute("SELECT * FROM checkout_sessions WHERE tenant_id=%s", (tenant_id,)).fetchone()
         remote_status = None
         if existing and existing["stripe_session_id"]:
             remote = self.gateway.retrieve_checkout(existing["stripe_session_id"])
@@ -66,22 +67,23 @@ class BillingService:
             if remote_status == "open":
                 return {"checkout_url": remote["url"], "session_id": remote["id"], "mode": "test"}
         with self.db.transaction() as conn:
-            row = conn.execute("SELECT * FROM checkout_sessions WHERE tenant_id=?", (tenant_id,)).fetchone()
+            lock_tenant(conn, tenant_id)
+            row = conn.execute("SELECT * FROM checkout_sessions WHERE tenant_id=%s", (tenant_id,)).fetchone()
             # A durable key also survives a crash between Stripe creation and local save.
             if not row:
-                conn.execute("INSERT INTO checkout_sessions(tenant_id,idempotency_key,expires_at) VALUES (?,?,?)",
+                conn.execute("INSERT INTO checkout_sessions(tenant_id,idempotency_key,expires_at) VALUES (%s,%s,%s)",
                              (tenant_id, f"checkout:{tenant_id}:1", now + 86400))
             elif (row["expires_at"] <= now or row["completed"] or remote_status in {"expired", "complete"}) and (not existing or row["generation"] == existing["generation"]):
                 generation = row["generation"] + 1
-                conn.execute("""UPDATE checkout_sessions SET generation=?,idempotency_key=?,stripe_session_id=NULL,
-                             checkout_url=NULL,expires_at=?,completed=0 WHERE tenant_id=?""",
+                conn.execute("""UPDATE checkout_sessions SET generation=%s,idempotency_key=%s,stripe_session_id=NULL,
+                             checkout_url=NULL,expires_at=%s,completed=0 WHERE tenant_id=%s""",
                              (generation, f"checkout:{tenant_id}:{generation}", now + 86400, tenant_id))
-            row = conn.execute("SELECT * FROM checkout_sessions WHERE tenant_id=?", (tenant_id,)).fetchone()
+            row = conn.execute("SELECT * FROM checkout_sessions WHERE tenant_id=%s", (tenant_id,)).fetchone()
             key = row["idempotency_key"]
         session = self.gateway.create_checkout(customer_id, tenant_id, key)
         with self.db.transaction() as conn:
-            conn.execute("""UPDATE checkout_sessions SET stripe_session_id=?,checkout_url=?,expires_at=?
-                         WHERE tenant_id=? AND idempotency_key=?""",
+            conn.execute("""UPDATE checkout_sessions SET stripe_session_id=%s,checkout_url=%s,expires_at=%s
+                         WHERE tenant_id=%s AND idempotency_key=%s""",
                          (session["id"], session["url"], session["expires_at"], tenant_id, key))
         return {"checkout_url": session["url"], "session_id": session["id"], "mode": "test"}
 
@@ -93,18 +95,19 @@ class BillingService:
         if not isinstance(customer, str):
             customer = None
         with self.db.transaction() as conn:
-            old = conn.execute("SELECT status FROM webhook_events WHERE event_id=?", (event["id"],)).fetchone()
+            conn.execute("SELECT pg_advisory_xact_lock(20, hashtext(%s))", (event["id"],))
+            old = conn.execute("SELECT status FROM webhook_events WHERE event_id=%s", (event["id"],)).fetchone()
             if old:
                 return {"received": True, "duplicate": True, "status": old["status"]}
-            tenant = conn.execute("SELECT id FROM tenants WHERE stripe_customer_id=?", (customer,)).fetchone()
+            tenant = conn.execute("SELECT id FROM tenants WHERE stripe_customer_id=%s", (customer,)).fetchone()
             supported = event["type"] in EVENT_TYPES and tenant is not None
             tenant_id = tenant["id"] if tenant else None
             status = "queued" if supported else "ignored"
-            conn.execute("INSERT INTO webhook_events VALUES (?,?,?,?,?)",
+            conn.execute("INSERT INTO webhook_events VALUES (%s,%s,%s,%s,%s)",
                          (event["id"], event["type"], tenant_id, status, utc_now().isoformat()))
             if supported:
-                conn.execute("INSERT INTO jobs(id,event_id,tenant_id,status,available_at) VALUES (?,?,?,'queued',?)",
+                conn.execute("INSERT INTO jobs(id,event_id,tenant_id,status,available_at) VALUES (%s,%s,%s,'queued',%s)",
                              (str(uuid4()), event["id"], tenant_id, int(time.time())))
                 if event["type"] == "checkout.session.completed":
-                    conn.execute("UPDATE checkout_sessions SET completed=1 WHERE tenant_id=? AND stripe_session_id=?", (tenant_id, obj.get("id")))
+                    conn.execute("UPDATE checkout_sessions SET completed=1 WHERE tenant_id=%s AND stripe_session_id=%s", (tenant_id, obj.get("id")))
         return {"received": True, "duplicate": False, "status": status}
